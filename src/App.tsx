@@ -7,6 +7,16 @@ type MagnetInfo = {
   trackers: string[];
 };
 
+type AddonStream = {
+  name?: string | null;
+  title?: string | null;
+  description?: string | null;
+  url?: string | null;
+  infoHash?: string | null;
+  fileIdx?: number | null;
+  sources?: string[] | null;
+};
+
 type Screen = "sources" | "player" | "settings";
 
 const isTauri = () => "__TAURI_INTERNALS__" in window;
@@ -21,7 +31,14 @@ function Icon({ name }: { name: "sources" | "player" | "settings" }) {
 
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d={paths[name]} fill={name === "player" ? "currentColor" : "none"} stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      <path
+        d={paths[name]}
+        fill={name === "player" ? "currentColor" : "none"}
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
     </svg>
   );
 }
@@ -36,6 +53,12 @@ export default function App() {
   const [streamUrl, setStreamUrl] = useState("");
   const [activeStream, setActiveStream] = useState("");
 
+  const [addonEndpoint, setAddonEndpoint] = useState("");
+  const [mediaType, setMediaType] = useState<"movie" | "series">("movie");
+  const [mediaId, setMediaId] = useState("");
+  const [addonStreams, setAddonStreams] = useState<AddonStream[]>([]);
+  const [resolving, setResolving] = useState(false);
+
   useEffect(() => {
     if (!isTauri()) return;
     invoke<string>("native_core_version")
@@ -44,6 +67,13 @@ export default function App() {
   }, []);
 
   const canParse = useMemo(() => magnet.trim().startsWith("magnet:?"), [magnet]);
+
+  async function inspectMagnet(uri: string) {
+    if (!isTauri()) throw new Error("Native C++ parsing only runs inside the Tauri desktop build.");
+    const info = await invoke<MagnetInfo>("parse_magnet", { input: uri.trim() });
+    setMagnetInfo(info);
+    return info;
+  }
 
   async function parseMagnet(event: FormEvent) {
     event.preventDefault();
@@ -55,15 +85,9 @@ export default function App() {
       return;
     }
 
-    if (!isTauri()) {
-      setError("Native C++ parsing runs inside the Tauri desktop build, not the browser preview.");
-      return;
-    }
-
     try {
       setWorking(true);
-      const info = await invoke<MagnetInfo>("parse_magnet", { input: magnet.trim() });
-      setMagnetInfo(info);
+      await inspectMagnet(magnet);
     } catch (reason) {
       setError(String(reason));
     } finally {
@@ -81,6 +105,70 @@ export default function App() {
     setError("");
     setActiveStream(value);
     setScreen("player");
+  }
+
+  async function resolveAddon(event: FormEvent) {
+    event.preventDefault();
+    setError("");
+    setAddonStreams([]);
+
+    if (!addonEndpoint.trim() || !mediaId.trim()) {
+      setError("Enter an addon endpoint and media ID.");
+      return;
+    }
+
+    if (!isTauri()) {
+      setError("Addon resolving runs through the Tauri backend, not the browser preview.");
+      return;
+    }
+
+    try {
+      setResolving(true);
+      const streams = await invoke<AddonStream[]>("resolve_addon_streams", {
+        addonUrl: addonEndpoint.trim(),
+        mediaType,
+        id: mediaId.trim(),
+      });
+      setAddonStreams(streams);
+      if (streams.length === 0) setError("The addon returned no streams for that ID.");
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setResolving(false);
+    }
+  }
+
+  function playResolvedUrl(stream: AddonStream) {
+    if (!stream.url) return;
+    setActiveStream(stream.url);
+    setScreen("player");
+  }
+
+  async function inspectResolvedTorrent(stream: AddonStream) {
+    if (!stream.infoHash) return;
+
+    const params = new URLSearchParams();
+    params.set("xt", `urn:btih:${stream.infoHash}`);
+    const name = stream.name || stream.title || stream.description;
+    if (name) params.set("dn", name);
+
+    for (const source of stream.sources || []) {
+      if (source.startsWith("tracker:")) params.append("tr", source.slice("tracker:".length));
+    }
+
+    const uri = `magnet:?${params.toString()}`;
+    setMagnet(uri);
+    setMagnetInfo(null);
+    setError("");
+
+    try {
+      setWorking(true);
+      await inspectMagnet(uri);
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setWorking(false);
+    }
   }
 
   return (
@@ -116,8 +204,10 @@ export default function App() {
             <section className="hero-card">
               <div className="hero-copy">
                 <span className="badge">Native torrent foundation</span>
-                <h2>Paste an authorized magnet.</h2>
-                <p>Torreplo sends magnet metadata into the compiled C++ core. Networking is kept behind the same native boundary so the playback engine can be added without rebuilding the UI.</p>
+                <h2>Resolve. Inspect. Play.</h2>
+                <p>
+                  Torreplo can read magnet metadata through its compiled C++ core and resolve a Stremio-compatible addon endpoint through Tauri. Direct URL results can play immediately in the built-in player.
+                </p>
               </div>
 
               <form onSubmit={parseMagnet} className="source-form">
@@ -162,14 +252,57 @@ export default function App() {
 
             <section className="side-stack">
               <div className="panel">
+                <p className="eyebrow">ADDON RESOLVER</p>
+                <h3>Stremio-compatible source</h3>
+                <p>Point Torreplo at an addon manifest/base URL you are authorized to use.</p>
+                <form onSubmit={resolveAddon} className="resolver-form">
+                  <input
+                    value={addonEndpoint}
+                    onChange={(e) => setAddonEndpoint(e.target.value)}
+                    placeholder="https://…/manifest.json"
+                    spellCheck={false}
+                  />
+                  <div className="resolver-row">
+                    <select value={mediaType} onChange={(e) => setMediaType(e.target.value as "movie" | "series") }>
+                      <option value="movie">Movie</option>
+                      <option value="series">Series</option>
+                    </select>
+                    <input value={mediaId} onChange={(e) => setMediaId(e.target.value)} placeholder="tt1234567" />
+                  </div>
+                  <button className="secondary" disabled={resolving}>{resolving ? "Resolving…" : "Resolve streams"}</button>
+                </form>
+
+                {addonStreams.length > 0 && (
+                  <div className="stream-results">
+                    {addonStreams.slice(0, 12).map((stream, index) => (
+                      <div className="stream-item" key={`${stream.infoHash || stream.url || index}-${index}`}>
+                        <div className="stream-copy">
+                          <strong>{stream.name || stream.title || `Stream ${index + 1}`}</strong>
+                          <span>
+                            {stream.infoHash ? `Torrent${stream.fileIdx != null ? ` · file ${stream.fileIdx}` : ""}` : "Direct URL"}
+                          </span>
+                        </div>
+                        {stream.url ? (
+                          <button className="mini-button" onClick={() => playResolvedUrl(stream)}>Play</button>
+                        ) : stream.infoHash ? (
+                          <button className="mini-button" onClick={() => inspectResolvedTorrent(stream)}>Inspect</button>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="panel">
                 <p className="eyebrow">DIRECT PLAYBACK</p>
                 <h3>Test the player</h3>
-                <p>Use a direct media URL you control to test the desktop playback surface.</p>
+                <p>Use a direct media URL you control to test the playback surface.</p>
                 <form onSubmit={playDirect}>
                   <input value={streamUrl} onChange={(e) => setStreamUrl(e.target.value)} placeholder="https://…/video.mp4" />
                   <button className="secondary">Open player</button>
                 </form>
               </div>
+
               <div className="panel technical">
                 <p className="eyebrow">ENGINE</p>
                 <h3>{coreVersion}</h3>
@@ -189,7 +322,7 @@ export default function App() {
               <div className="empty-player">
                 <div className="play-orb"><Icon name="player" /></div>
                 <h2>Nothing is playing</h2>
-                <p>Open a direct stream from Sources. Torrent-backed playback will plug into this same surface.</p>
+                <p>Open a direct stream from Sources. Torrent-backed HTTP streaming can plug into this same player surface next.</p>
                 <button className="secondary" onClick={() => setScreen("sources")}>Choose source</button>
               </div>
             )}
@@ -201,12 +334,12 @@ export default function App() {
             <div className="panel">
               <p className="eyebrow">NATIVE CORE</p>
               <h3>{coreVersion}</h3>
-              <p>The core is statically compiled into the Tauri binary through the Rust build script.</p>
+              <p>The C++17 core is statically compiled into the Tauri backend through Rust FFI.</p>
             </div>
             <div className="panel">
               <p className="eyebrow">SOURCE POLICY</p>
               <h3>Authorized content</h3>
-              <p>This build intentionally ships without a preconfigured third-party torrent index. Provider adapters can be connected for catalogs you have permission to use.</p>
+              <p>No third-party torrent index is hard-coded. Enter an addon endpoint only for catalogs and streams you have permission to access.</p>
             </div>
           </section>
         )}
